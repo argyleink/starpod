@@ -20,11 +20,23 @@ interface RateLimitResult {
 
 const buckets = new Map<string, { count: number; resetAt: number }>();
 
+/** Drops any bucket whose window has already elapsed, so the map only ever
+ * holds entries for clients currently inside an active window - otherwise
+ * it grows forever, one entry per unique client key ever seen. */
+function pruneExpiredBuckets(now: number): void {
+  for (const [key, bucket] of buckets) {
+    if (bucket.resetAt <= now) {
+      buckets.delete(key);
+    }
+  }
+}
+
 export function checkRateLimit(
   key: string,
   { limit, windowMs }: RateLimitOptions
 ): RateLimitResult {
   const now = Date.now();
+  pruneExpiredBuckets(now);
   const bucket = buckets.get(key);
 
   if (!bucket || bucket.resetAt <= now) {
@@ -48,24 +60,49 @@ export function checkRateLimit(
   };
 }
 
-/** Derives a rate-limit key from the client's IP, falling back to a shared
- * bucket if no forwarding header is present (e.g. local dev). */
+/**
+ * Derives a rate-limit key from the client's IP, falling back to a shared
+ * bucket if no forwarding header is present (e.g. local dev).
+ *
+ * Prefers `x-vercel-forwarded-for`: on Vercel (this project's target
+ * deployment), `x-forwarded-for` is already overwritten at the edge and
+ * client-supplied values are stripped, so both headers carry the same real
+ * IP there - but `x-vercel-forwarded-for` stays trustworthy even behind an
+ * extra reverse proxy in front of Vercel, where `x-forwarded-for` could be
+ * appended to instead of replaced. Deployed anywhere else (not Vercel),
+ * `x-forwarded-for` is only as trustworthy as whatever's terminating TLS in
+ * front of the app - fine for this project's actual target, worth keeping
+ * in mind for anyone self-hosting the OSS template differently.
+ */
 export function clientKey(request: Request): string {
-  const forwardedFor = request.headers.get('x-forwarded-for');
+  const forwardedFor =
+    request.headers.get('x-vercel-forwarded-for') ??
+    request.headers.get('x-forwarded-for');
   return forwardedFor?.split(',')[0]?.trim() || 'unknown';
 }
 
 export function rateLimitHeaders(
   result: RateLimitResult
 ): Record<string, string> {
+  const secondsUntilReset = Math.max(
+    0,
+    result.resetAt - Math.floor(Date.now() / 1000)
+  );
   return {
     'RateLimit-Limit': String(result.limit),
     'RateLimit-Remaining': String(result.remaining),
-    'RateLimit-Reset': String(result.resetAt)
+    // Per the IETF RateLimit header draft, Reset is seconds until the
+    // window resets (delta), not an absolute epoch timestamp.
+    'RateLimit-Reset': String(secondsUntilReset)
   };
 }
 
 /** Test-only: clears all bucket state between test cases. */
 export function __resetRateLimitBucketsForTests(): void {
   buckets.clear();
+}
+
+/** Test-only: exposes the current bucket count to verify pruning. */
+export function __debugBucketCount(): number {
+  return buckets.size;
 }

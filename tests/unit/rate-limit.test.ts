@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  __debugBucketCount,
   __resetRateLimitBucketsForTests,
   checkRateLimit,
   clientKey,
@@ -64,9 +65,28 @@ describe('rate-limit', () => {
     expect(afterWindow.remaining).toBe(0);
   });
 
-  it('derives the client key from x-forwarded-for, taking the first hop', () => {
+  it('derives the client key from x-vercel-forwarded-for when present', () => {
+    const request = new Request('http://localhost/api/contact', {
+      headers: { 'x-vercel-forwarded-for': '203.0.113.4' }
+    });
+
+    expect(clientKey(request)).toBe('203.0.113.4');
+  });
+
+  it('falls back to x-forwarded-for, taking the first hop, when there is no x-vercel-forwarded-for', () => {
     const request = new Request('http://localhost/api/contact', {
       headers: { 'x-forwarded-for': '203.0.113.4, 10.0.0.1' }
+    });
+
+    expect(clientKey(request)).toBe('203.0.113.4');
+  });
+
+  it('prefers x-vercel-forwarded-for over x-forwarded-for when both are present', () => {
+    const request = new Request('http://localhost/api/contact', {
+      headers: {
+        'x-vercel-forwarded-for': '203.0.113.4',
+        'x-forwarded-for': '198.51.100.9'
+      }
     });
 
     expect(clientKey(request)).toBe('203.0.113.4');
@@ -78,18 +98,59 @@ describe('rate-limit', () => {
     expect(clientKey(request)).toBe('unknown');
   });
 
-  it('formats standard RateLimit-* headers', () => {
+  it('formats RateLimit-Limit and RateLimit-Remaining as-is', () => {
     const headers = rateLimitHeaders({
       allowed: true,
       limit: 5,
       remaining: 4,
-      resetAt: 1_700_000_000
+      resetAt: Math.floor(Date.now() / 1000) + 30
     });
 
-    expect(headers).toEqual({
-      'RateLimit-Limit': '5',
-      'RateLimit-Remaining': '4',
-      'RateLimit-Reset': '1700000000'
+    expect(headers['RateLimit-Limit']).toBe('5');
+    expect(headers['RateLimit-Remaining']).toBe('4');
+  });
+
+  it('formats RateLimit-Reset as seconds until reset, not an absolute epoch', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_700_000_000_000);
+
+    const headers = rateLimitHeaders({
+      allowed: true,
+      limit: 5,
+      remaining: 4,
+      resetAt: 1_700_000_030 // 30s after the current mocked time
     });
+
+    expect(headers['RateLimit-Reset']).toBe('30');
+  });
+
+  it('never reports a negative RateLimit-Reset for an already-elapsed window', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_700_000_100_000);
+
+    const headers = rateLimitHeaders({
+      allowed: true,
+      limit: 5,
+      remaining: 4,
+      resetAt: 1_700_000_000 // already in the past relative to mocked time
+    });
+
+    expect(headers['RateLimit-Reset']).toBe('0');
+  });
+
+  it('prunes expired buckets so the store does not grow unbounded', () => {
+    vi.useFakeTimers();
+    const opts = { limit: 1, windowMs: 1_000 };
+
+    checkRateLimit('client-f', opts);
+    checkRateLimit('client-g', opts);
+    expect(__debugBucketCount()).toBe(2);
+
+    vi.advanceTimersByTime(1_001);
+    checkRateLimit('client-h', opts);
+
+    // client-f and client-g's windows elapsed and get pruned on the next
+    // call; only the fresh client-h bucket should remain.
+    expect(__debugBucketCount()).toBe(1);
   });
 });
